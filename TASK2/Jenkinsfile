@@ -1,0 +1,218 @@
+// Task 8 - Automated Blue-Green Deployment using Jenkins, Docker and Kubernetes (k3s) on AWS EC2
+//
+// Two copies of the app run side by side: BLUE and GREEN. Only one is LIVE (port 30090).
+// A new release is deployed to the IDLE color, tested on the preview port (30091),
+// then live traffic is switched in one step by changing the Service selector.
+// The old color keeps running, so rollback is an instant switch back.
+
+// ---------- helper functions ----------
+def otherColor(String c) { return c == 'blue' ? 'green' : 'blue' }
+
+def isDeploy() { return (params.ACTION ?: 'deploy') == 'deploy' }
+
+// Point the live Service at newLive, and the preview Service at the other color.
+def switchTraffic(String newLive) {
+    def newPreview = otherColor(newLive)
+    sh """
+        echo "Switching LIVE traffic -> ${newLive}  (preview -> ${newPreview})"
+        kubectl -n ${env.NAMESPACE} patch svc meditrack-live    -p '{"spec":{"selector":{"color":"${newLive}"}}}'
+        kubectl -n ${env.NAMESPACE} patch svc meditrack-preview -p '{"spec":{"selector":{"color":"${newPreview}"}}}'
+    """
+}
+
+// Call /api/info on a URL until it reports the expected color (and version, if given).
+def checkEndpoint(String url, String color, String version) {
+    sh """
+        for i in \$(seq 1 20); do
+            BODY=\$(curl -fsS ${url}/api/info 2>/dev/null || true)
+            if echo "\$BODY" | grep -q '"color":"${color}"' && { [ -z "${version}" ] || echo "\$BODY" | grep -q '"version":"${version}"'; }; then
+                echo "OK ${url} -> \$BODY"
+                exit 0
+            fi
+            sleep 2
+        done
+        echo "FAILED: ${url} did not serve color=${color} version=${version}. Last response: \$BODY"
+        exit 1
+    """
+}
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '15'))
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    // a new commit on GitHub starts a blue-green release automatically
+    triggers {
+        pollSCM('H/2 * * * *')
+    }
+
+    parameters {
+        choice(name: 'ACTION', choices: ['deploy', 'rollback'],
+            description: 'deploy = release this commit to the idle color and switch traffic to it.  rollback = instantly switch live traffic back to the other color (no build).')
+        booleanParam(name: 'REQUIRE_APPROVAL', defaultValue: true,
+            description: 'Pause for a manual "Switch traffic" approval after the new color passes its tests')
+    }
+
+    environment {
+        IMAGE       = "meditrack-bg:${BUILD_NUMBER}"
+        NAMESPACE   = 'pbl3-bg'
+        KUBECONFIG  = '/var/lib/jenkins/.kube/config'
+        TASK_DIR    = 'TASK2'
+        LIVE_URL    = 'http://localhost:30090'
+        PREVIEW_URL = 'http://localhost:30091'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                sh 'git log -1 --pretty="Commit %h by %an: %s"'
+            }
+        }
+
+        stage('Prepare Cluster') {
+            steps {
+                sh '''
+                    kubectl apply -f ${TASK_DIR}/k8s/namespace.yaml
+                    # create the live/preview Services only once, so re-running never resets the live color
+                    kubectl -n ${NAMESPACE} get svc meditrack-live >/dev/null 2>&1 || kubectl apply -f ${TASK_DIR}/k8s/services.yaml
+                '''
+            }
+        }
+
+        stage('Detect Live Color') {
+            steps {
+                script {
+                    env.LIVE_COLOR = sh(returnStdout: true,
+                        script: "kubectl -n ${env.NAMESPACE} get svc meditrack-live -o jsonpath='{.spec.selector.color}'").trim()
+                    env.IDLE_COLOR = otherColor(env.LIVE_COLOR)
+                    env.LIVE_EXISTS = (sh(returnStatus: true,
+                        script: "kubectl -n ${env.NAMESPACE} get deploy meditrack-${env.LIVE_COLOR} >/dev/null 2>&1") == 0) ? 'true' : 'false'
+                    // very first release: nothing is live yet, so it goes straight to the live color
+                    env.TARGET_COLOR = (env.LIVE_EXISTS == 'true') ? env.IDLE_COLOR : env.LIVE_COLOR
+                    echo "LIVE color: ${env.LIVE_COLOR} (running: ${env.LIVE_EXISTS})  |  IDLE color: ${env.IDLE_COLOR}"
+                    if (isDeploy()) {
+                        echo "This release (v${env.BUILD_NUMBER}) will be deployed to: ${env.TARGET_COLOR.toUpperCase()}"
+                    }
+                }
+            }
+        }
+
+        // ---------------- DEPLOY path ----------------
+        stage('Unit Tests') {
+            when { expression { isDeploy() } }
+            steps {
+                sh 'docker build --target test -t meditrack-bg-test:${BUILD_NUMBER} ${TASK_DIR}'
+            }
+        }
+
+        stage('Build Docker Image') {
+            when { expression { isDeploy() } }
+            steps {
+                sh 'docker build --target runtime -t ${IMAGE} ${TASK_DIR}'
+            }
+        }
+
+        stage('Deploy to Idle Color') {
+            when { expression { isDeploy() } }
+            steps {
+                sh """
+                    sed -e 's|__COLOR__|${env.TARGET_COLOR}|g' \
+                        -e 's|__IMAGE__|${env.IMAGE}|g' \
+                        -e 's|__VERSION__|${env.BUILD_NUMBER}|g' \
+                        ${env.TASK_DIR}/k8s/deployment.yaml | kubectl apply -f -
+                    kubectl -n ${env.NAMESPACE} rollout status deployment/meditrack-${env.TARGET_COLOR} --timeout=180s
+                """
+            }
+        }
+
+        stage('Test Idle Color (Preview)') {
+            when { expression { isDeploy() } }
+            steps {
+                script {
+                    // send the preview Service to the new color; real users are still on the live color
+                    sh "kubectl -n ${env.NAMESPACE} patch svc meditrack-preview -p '{\"spec\":{\"selector\":{\"color\":\"${env.TARGET_COLOR}\"}}}'"
+                    checkEndpoint(env.PREVIEW_URL, env.TARGET_COLOR, env.BUILD_NUMBER)
+                    sh 'curl -fsS ${PREVIEW_URL}/health && echo && curl -fsS ${PREVIEW_URL}/api/patients >/dev/null && echo "Preview API OK"'
+                }
+            }
+        }
+
+        stage('Approval: Switch Traffic?') {
+            when { expression { isDeploy() && params.REQUIRE_APPROVAL != false && env.LIVE_EXISTS == 'true' } }
+            steps {
+                timeout(time: 15, unit: 'MINUTES') {
+                    input id: 'SwitchTraffic', ok: 'Switch traffic',
+                        message: "v${env.BUILD_NUMBER} passed its tests on ${env.TARGET_COLOR.toUpperCase()} (preview port 30091). Switch LIVE traffic from ${env.LIVE_COLOR.toUpperCase()} to ${env.TARGET_COLOR.toUpperCase()}?"
+                }
+            }
+        }
+
+        stage('Switch Traffic') {
+            when { expression { isDeploy() } }
+            steps {
+                script { switchTraffic(env.TARGET_COLOR) }
+            }
+        }
+
+        stage('Verify Live') {
+            when { expression { isDeploy() } }
+            steps {
+                script {
+                    try {
+                        checkEndpoint(env.LIVE_URL, env.TARGET_COLOR, env.BUILD_NUMBER)
+                    } catch (err) {
+                        if (env.LIVE_EXISTS == 'true') {
+                            echo "Live check failed - automatic rollback to ${env.LIVE_COLOR}"
+                            switchTraffic(env.LIVE_COLOR)
+                        }
+                        throw err
+                    }
+                }
+            }
+        }
+
+        // ---------------- ROLLBACK path ----------------
+        stage('Rollback: Switch Back') {
+            when { expression { !isDeploy() } }
+            steps {
+                script {
+                    def target = env.IDLE_COLOR
+                    if (sh(returnStatus: true, script: "kubectl -n ${env.NAMESPACE} get deploy meditrack-${target} >/dev/null 2>&1") != 0) {
+                        error "Nothing to roll back to: the ${target} environment does not exist yet"
+                    }
+                    sh "kubectl -n ${env.NAMESPACE} rollout status deployment/meditrack-${target} --timeout=120s"
+                    switchTraffic(target)
+                    checkEndpoint(env.LIVE_URL, target, '')
+                    echo "Rolled back: LIVE is now ${target.toUpperCase()}"
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            sh '''
+                echo "=========== Blue-Green status ==========="
+                kubectl -n ${NAMESPACE} get svc -o custom-columns=SERVICE:.metadata.name,COLOR:.spec.selector.color,NODEPORT:.spec.ports[0].nodePort
+                kubectl -n ${NAMESPACE} get deploy -L color -o wide
+                kubectl -n ${NAMESPACE} get pods -L color -o wide
+                echo "LIVE    : $(curl -s ${LIVE_URL}/api/info)"
+                echo "PREVIEW : $(curl -s ${PREVIEW_URL}/api/info)"
+            '''
+        }
+        always {
+            // keep disk usage low on the small EC2 instance
+            sh '''
+                docker rmi meditrack-bg-test:${BUILD_NUMBER} 2>/dev/null || true
+                docker images meditrack-bg --format '{{.Tag}}' | grep -E '^[0-9]+$' | sort -n | head -n -4 | xargs -r -I{} docker rmi meditrack-bg:{} 2>/dev/null || true
+                docker image prune -f || true
+            '''
+        }
+    }
+}

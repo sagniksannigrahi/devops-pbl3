@@ -1,0 +1,14 @@
+{
+  "name": "meditrack",
+  "version": "1.0.0",
+  "description": "Patient records demo service for DevOps PBL-III",
+  "main": "src/server.js",
+  "private": true,
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

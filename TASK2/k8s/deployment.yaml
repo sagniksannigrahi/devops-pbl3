@@ -1,0 +1,60 @@
+# One template for both environments. The Jenkins pipeline fills in
+#   __COLOR__   -> blue | green
+#   __IMAGE__   -> meditrack-bg:<build number>
+#   __VERSION__ -> <build number>
+# and applies it as the Deployment "meditrack-blue" or "meditrack-green".
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meditrack-__COLOR__
+  namespace: pbl3-bg
+  labels:
+    app: meditrack-bg
+    color: __COLOR__
+spec:
+  replicas: 1          # 1 pod per color keeps both environments inside a t3.micro
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: meditrack-bg
+      color: __COLOR__
+  template:
+    metadata:
+      labels:
+        app: meditrack-bg
+        color: __COLOR__
+    spec:
+      containers:
+        - name: meditrack
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          env:
+            - name: APP_VERSION
+              value: "__VERSION__"
+            - name: APP_COLOR
+              value: "__COLOR__"
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 96Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false

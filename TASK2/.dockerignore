@@ -1,0 +1,8 @@
+.git
+*.pem
+docs
+infra
+k8s
+Jenkinsfile
+README.md
+**/node_modules
