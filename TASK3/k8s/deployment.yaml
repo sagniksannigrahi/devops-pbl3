@@ -1,0 +1,67 @@
+# __TAG__ is replaced by the Jenkins build number at deploy time.
+# Credentials come from the Secret "meditrack-secrets", which the pipeline creates on the cluster;
+# it is never stored in git or printed in logs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meditrack-secure
+  namespace: pbl3-sec
+  labels:
+    app: meditrack-secure
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: meditrack-secure
+  template:
+    metadata:
+      labels:
+        app: meditrack-secure
+    spec:
+      automountServiceAccountToken: false   # the app never talks to the Kubernetes API
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: meditrack
+          image: meditrack-secure:__TAG__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          env:
+            - name: APP_VERSION
+              value: "__TAG__"
+            - name: DOCTOR_TOKEN
+              valueFrom:
+                secretKeyRef: { name: meditrack-secrets, key: doctor-token }
+            - name: STAFF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: meditrack-secrets, key: staff-token }
+            - name: PHI_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef: { name: meditrack-secrets, key: phi-encryption-key }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 25m
+              memory: 48Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          readinessProbe:
+            httpGet: { path: /health, port: 3000 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: 3000 }
+            initialDelaySeconds: 10
+            periodSeconds: 15

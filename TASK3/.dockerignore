@@ -1,0 +1,10 @@
+*.pem
+*.key
+.env
+reports
+security
+infra
+k8s
+Jenkinsfile
+README.md
+**/node_modules

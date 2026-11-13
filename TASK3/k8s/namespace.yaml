@@ -1,0 +1,11 @@
+# Pod Security Admission "restricted": Kubernetes itself rejects any pod in this namespace
+# that runs as root, allows privilege escalation, keeps Linux capabilities, etc.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pbl3-sec
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

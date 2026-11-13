@@ -1,0 +1,239 @@
+// Task 9 - Secure DevOps (DevSecOps) pipeline for a healthcare system
+//
+// "Shift-left" security: every stage below is a SECURITY GATE. If a gate finds a problem
+// the pipeline stops and the vulnerable version never reaches Kubernetes.
+//
+//  Code       ─► 1 Secret scan (Gitleaks) ─► 2 SAST (ESLint security) ─► 3 SCA (Trivy fs)
+//  Infra      ─► 4 IaC scan (Trivy config: Dockerfile + Kubernetes YAML)
+//  Build      ─► 5 Unit + security tests ─► 6 Build hardened image ─► 7 Image scan (Trivy)
+//  Deploy     ─► 8 Deploy (Secret, NetworkPolicy, Pod Security "restricted")
+//  Runtime    ─► 9 DAST against the running app ─► 10 Runtime policy checks
+//  Evidence   ─► all reports archived as build artifacts (audit trail)
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '15'))
+        timeout(time: 40, unit: 'MINUTES')
+    }
+
+    triggers {
+        pollSCM('H/2 * * * *')
+    }
+
+    environment {
+        TASK_DIR        = 'TASK3'
+        IMAGE           = "meditrack-secure:${BUILD_NUMBER}"
+        NAMESPACE       = 'pbl3-sec'
+        KUBECONFIG      = '/var/lib/jenkins/.kube/config'
+        APP_URL         = 'http://localhost:30100'
+        TRIVY_CACHE_DIR = '/var/lib/jenkins/.cache/trivy'
+        // pinned SAST tool versions (supply-chain hygiene)
+        ESLINT_PKGS     = 'eslint@9.39.5 eslint-plugin-security@3.0.1'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                sh '''
+                    git log -1 --pretty="Commit %h by %an: %s"
+                    rm -rf reports && mkdir -p reports
+                    gitleaks version; trivy --version | head -1
+                '''
+            }
+        }
+
+        stage('1. Secret Scan (Gitleaks)') {
+            steps {
+                // scans the WHOLE git history: a password committed once and deleted later is still a leak
+                sh '''
+                    rc=0
+                    gitleaks git . --redact --no-banner --exit-code 1 \
+                        --report-format json --report-path reports/gitleaks.json > reports/gitleaks.txt 2>&1 || rc=$?
+                    cat reports/gitleaks.txt
+                    exit $rc
+                '''
+            }
+        }
+
+        stage('2. SAST (ESLint Security)') {
+            steps {
+                sh '''
+                    rc=0
+                    docker run --rm -u $(id -u):$(id -g) -e HOME=/tmp -e npm_config_cache=/tmp/.npm \
+                        -v "$WORKSPACE/$TASK_DIR:/work:ro" -w /work node:22-alpine sh -c "
+                            npm install --no-save --ignore-scripts --no-audit --no-fund --loglevel=error --prefix /tmp/sast $ESLINT_PKGS >/dev/null &&
+                            NODE_PATH=/tmp/sast/node_modules /tmp/sast/node_modules/.bin/eslint -c security/eslint.config.cjs app/src app/public
+                        " > reports/sast-eslint.txt 2>&1 || rc=$?
+                    cat reports/sast-eslint.txt
+                    [ -s reports/sast-eslint.txt ] || echo "ESLint: no findings" | tee reports/sast-eslint.txt
+                    exit $rc
+                '''
+            }
+        }
+
+        stage('3. SCA - Dependencies (Trivy fs)') {
+            steps {
+                sh '''
+                    rc=0
+                    trivy fs --quiet --scanners vuln,secret --severity HIGH,CRITICAL --exit-code 1 \
+                        $TASK_DIR/app > reports/sca-trivy-fs.txt 2>&1 || rc=$?
+                    cat reports/sca-trivy-fs.txt
+                    exit $rc
+                '''
+            }
+        }
+
+        stage('4. IaC Scan (Trivy config)') {
+            steps {
+                sh '''
+                    # full report (all severities) for review ...
+                    trivy config --quiet $TASK_DIR > reports/iac-trivy-config.txt 2>&1 || true
+                    cat reports/iac-trivy-config.txt
+                    # ... but only HIGH/CRITICAL misconfigurations fail the build
+                    trivy config --quiet --severity HIGH,CRITICAL --exit-code 1 $TASK_DIR > /dev/null
+                '''
+            }
+        }
+
+        stage('5. Unit & Security Tests') {
+            steps {
+                sh 'docker build --target test -t meditrack-secure-test:${BUILD_NUMBER} ${TASK_DIR}'
+            }
+        }
+
+        stage('6. Build Hardened Image') {
+            steps {
+                sh 'docker build --target runtime -t ${IMAGE} ${TASK_DIR}'
+            }
+        }
+
+        stage('7. Image Scan (Trivy image)') {
+            steps {
+                sh '''
+                    # full report, all severities
+                    trivy image --quiet --skip-java-db-update --scanners vuln,secret ${IMAGE} > reports/image-trivy.txt 2>&1 || true
+                    cat reports/image-trivy.txt
+                    # gate: any fixable HIGH/CRITICAL vulnerability or embedded secret blocks the release
+                    trivy image --quiet --skip-db-update --skip-java-db-update --scanners vuln,secret \
+                        --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 ${IMAGE} > /dev/null
+                '''
+            }
+        }
+
+        stage('8. Secure Deploy to Kubernetes') {
+            steps {
+                sh '''
+                    set +x   # nothing secret is ever echoed into the build log
+                    kubectl apply -f $TASK_DIR/k8s/namespace.yaml
+                    kubectl apply -f $TASK_DIR/k8s/networkpolicy.yaml
+                    # credentials are generated ON the cluster the first time, never stored in git or Jenkins logs
+                    if ! kubectl -n $NAMESPACE get secret meditrack-secrets >/dev/null 2>&1; then
+                        kubectl -n $NAMESPACE create secret generic meditrack-secrets \
+                            --from-literal=doctor-token="$(openssl rand -hex 24)" \
+                            --from-literal=staff-token="$(openssl rand -hex 24)" \
+                            --from-literal=phi-encryption-key="$(openssl rand -hex 32)"
+                        echo "Created Secret meditrack-secrets (values not shown)"
+                    else
+                        echo "Secret meditrack-secrets already exists (values not shown)"
+                    fi
+                    sed "s|__TAG__|${BUILD_NUMBER}|g" $TASK_DIR/k8s/deployment.yaml | kubectl apply -f -
+                    kubectl apply -f $TASK_DIR/k8s/service.yaml
+                    kubectl -n $NAMESPACE rollout status deployment/meditrack-secure --timeout=180s
+                '''
+            }
+        }
+
+        stage('9. DAST (running app)') {
+            steps {
+                sh '''
+                    set +x
+                    DOCTOR_TOKEN=$(kubectl -n $NAMESPACE get secret meditrack-secrets -o jsonpath='{.data.doctor-token}' | base64 -d)
+                    STAFF_TOKEN=$(kubectl -n $NAMESPACE get secret meditrack-secrets -o jsonpath='{.data.staff-token}' | base64 -d)
+                    for i in $(seq 1 20); do curl -fs $APP_URL/health >/dev/null && break; sleep 3; done
+                    rc=0
+                    BASE_URL=$APP_URL DOCTOR_TOKEN=$DOCTOR_TOKEN STAFF_TOKEN=$STAFF_TOKEN \
+                        bash $TASK_DIR/security/dast-baseline.sh > reports/dast.txt 2>&1 || rc=$?
+                    cat reports/dast.txt
+                    exit $rc
+                '''
+            }
+        }
+
+        stage('10. Runtime Policy Checks') {
+            steps {
+                sh '''
+                    # subshell: an `exit 1` inside stops only the checks, so the report is still printed
+                    (
+                    echo "== Pod security context (live) =="
+                    kubectl -n $NAMESPACE get pod -l app=meditrack-secure -o jsonpath='{range .items[*]}{.metadata.name}{"\\n  runAsUser="}{.spec.securityContext.runAsUser}{"  runAsNonRoot="}{.spec.securityContext.runAsNonRoot}{"  seccomp="}{.spec.securityContext.seccompProfile.type}{"\\n  readOnlyRootFilesystem="}{.spec.containers[0].securityContext.readOnlyRootFilesystem}{"  allowPrivilegeEscalation="}{.spec.containers[0].securityContext.allowPrivilegeEscalation}{"  capabilitiesDrop="}{.spec.containers[0].securityContext.capabilities.drop}{"\\n"}{end}'
+
+                    echo; echo "== Pod Security Admission: a privileged root pod must be REJECTED =="
+                    if cat <<EOF | kubectl apply --dry-run=server -f - 2>&1
+apiVersion: v1
+kind: Pod
+metadata: { name: psa-violation-test, namespace: pbl3-sec }
+spec:
+  containers:
+    - name: bad
+      image: ${IMAGE}
+      securityContext: { privileged: true, runAsUser: 0 }
+EOF
+                    then echo "[FAIL] privileged pod was accepted"; exit 1
+                    else echo "[PASS] privileged pod rejected by Pod Security Admission"; fi
+
+                    echo; echo "== NetworkPolicy: outbound internet from the app pod must be BLOCKED =="
+                    if kubectl -n $NAMESPACE exec deploy/meditrack-secure -- node -e "fetch('http://1.1.1.1',{signal:AbortSignal.timeout(5000)}).then(()=>process.exit(0)).catch(()=>process.exit(1))"
+                    then echo "[FAIL] pod could reach the internet"; exit 1
+                    else echo "[PASS] egress blocked: a compromised pod cannot exfiltrate patient data"; fi
+
+                    echo; echo "== Read-only filesystem: writing inside the container must FAIL =="
+                    if kubectl -n $NAMESPACE exec deploy/meditrack-secure -- node -e "require('fs').writeFileSync('/app/pwned','x')" 2>/dev/null
+                    then echo "[FAIL] container filesystem is writable"; exit 1
+                    else echo "[PASS] root filesystem is read-only"; fi
+
+                    echo; echo "== Audit log sample (no PHI values) =="
+                    kubectl -n $NAMESPACE logs deploy/meditrack-secure --tail=5
+                    ) > reports/runtime-policy.txt 2>&1 || { cat reports/runtime-policy.txt; exit 1; }
+                    cat reports/runtime-policy.txt
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            sh '''
+                {
+                echo "MediTrack Secure - DevSecOps security summary - build ${BUILD_NUMBER} ($(date -u +%FT%TZ))"
+                echo "Commit: $(git log -1 --pretty='%h %s')"
+                echo
+                echo "PASS  1. Secret scan (Gitleaks, full git history) - $(grep -o 'no leaks found' reports/gitleaks.txt || echo see report)"
+                echo "PASS  2. SAST (ESLint security) - $(grep -oE '[0-9]+ errors?, [0-9]+ warnings?' reports/sast-eslint.txt || echo 'no findings')"
+                echo "PASS  3. SCA (Trivy fs) - no HIGH/CRITICAL dependency vulnerabilities"
+                echo "PASS  4. IaC scan (Trivy config) - no HIGH/CRITICAL misconfigurations"
+                echo "PASS  5. Unit + security tests"
+                echo "PASS  6. Hardened image built: ${IMAGE}"
+                echo "PASS  7. Image scan (Trivy) - no fixable HIGH/CRITICAL vulnerabilities"
+                echo "PASS  8. Deployed with Secret, NetworkPolicy, Pod Security 'restricted'"
+                echo "PASS  9. DAST - $(grep RESULT reports/dast.txt)"
+                echo "PASS 10. Runtime policy checks - $(grep -c '\\[PASS\\]' reports/runtime-policy.txt) passed"
+                echo
+                echo "App: http://<EC2-PUBLIC-IP>:30100"
+                } | tee reports/SECURITY-SUMMARY.txt
+            '''
+        }
+        always {
+            archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
+            sh '''
+                docker rmi meditrack-secure-test:${BUILD_NUMBER} 2>/dev/null || true
+                docker images meditrack-secure --format '{{.Tag}}' | grep -E '^[0-9]+$' | sort -n | head -n -2 | xargs -r -I{} docker rmi meditrack-secure:{} 2>/dev/null || true
+                docker image prune -f >/dev/null || true
+            '''
+        }
+    }
+}

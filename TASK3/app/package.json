@@ -1,0 +1,15 @@
+{
+  "name": "meditrack-secure",
+  "version": "1.0.0",
+  "description": "Security-hardened patient records service for the DevSecOps task (PBL-III)",
+  "main": "src/server.js",
+  "private": true,
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

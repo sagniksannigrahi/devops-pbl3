@@ -1,0 +1,27 @@
+# Zero-trust networking for the namespace:
+#  1. deny ALL ingress and egress by default
+#  2. allow only inbound HTTP to the app on port 3000
+# The app needs no outbound access at all, so a compromised pod cannot exfiltrate patient data.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: pbl3-sec
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-http-to-meditrack
+  namespace: pbl3-sec
+spec:
+  podSelector:
+    matchLabels:
+      app: meditrack-secure
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 3000

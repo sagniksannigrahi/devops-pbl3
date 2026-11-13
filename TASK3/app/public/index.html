@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MediTrack Secure</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header>
+    <h1>MediTrack Secure</h1>
+    <div>Patient records, built with a DevSecOps pipeline</div>
+    <div class="badges">
+      <span>Encrypted PHI (AES-256-GCM)</span><span>Role-based access</span><span>Audit logged</span><span>Scanned: Gitleaks, ESLint, Trivy, DAST</span>
+    </div>
+  </header>
+  <main>
+    <div class="card">
+      <h2>Sign in</h2>
+      <p class="muted">Paste a <b>doctor</b> token (full records) or a <b>staff</b> token (PHI masked). The token stays in memory only.</p>
+      <form id="login">
+        <input id="token" type="password" autocomplete="off" placeholder="Access token" required>
+        <button type="submit">Load patients</button>
+      </form>
+      <div id="status" class="muted"></div>
+    </div>
+    <div class="card">
+      <h2>Patients</h2>
+      <table>
+        <thead><tr><th>ID</th><th>Name</th><th>Age</th><th>Department</th><th>Phone</th><th>Diagnosis</th></tr></thead>
+        <tbody id="rows"><tr><td colspan="6" class="muted">Sign in to view records</td></tr></tbody>
+      </table>
+    </div>
+    <div class="muted" id="version"></div>
+  </main>
+</body>
+</html>
