@@ -26,6 +26,7 @@ apt-get update -y
 apt-get install -y docker.io git curl fontconfig
 apt-get install -y openjdk-21-jre-headless || apt-get install -y openjdk-25-jre-headless
 systemctl enable --now docker
+apt-get clean   # free disk space (8 GB root volume)
 
 echo "==> 3/6 k3s (lightweight Kubernetes) using Docker as its container runtime"
 # --docker: k3s runs pods with the same Docker daemon Jenkins builds images with,
