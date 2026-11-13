@@ -3,7 +3,7 @@
 #   swap + Docker + k3s (Kubernetes) + Jenkins (with plugins and the pipeline job pre-created)
 #
 # Usage (on the EC2 instance):
-#   sudo JENKINS_ADMIN_PASSWORD='choose-a-password' bash setup-ec2.sh https://github.com/<user>/<repo>.git
+#   sudo JENKINS_ADMIN_PASSWORD='choose-a-password' bash TASK1/infra/setup-ec2.sh https://github.com/<user>/<repo>.git
 set -euo pipefail
 
 REPO_URL="${1:?usage: setup-ec2.sh <git repo url>}"
@@ -83,7 +83,7 @@ if (j.getItem('${JOB_NAME}') == null) {
                        [new BranchSpec('*/main')], null, null, [])
   def job = j.createProject(WorkflowJob, '${JOB_NAME}')
   job.setDescription('Task 7: CI/CD pipeline deploying the Dockerized MediTrack app to Kubernetes (k3s) on AWS EC2')
-  job.setDefinition(new CpsScmFlowDefinition(scm, 'Jenkinsfile'))
+  job.setDefinition(new CpsScmFlowDefinition(scm, 'TASK1/Jenkinsfile'))
   job.save()
 }
 j.save()

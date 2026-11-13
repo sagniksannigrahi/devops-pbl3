@@ -24,6 +24,7 @@ pipeline {
         IMAGE      = "meditrack:${BUILD_NUMBER}"
         NAMESPACE  = 'pbl3'
         KUBECONFIG = '/var/lib/jenkins/.kube/config'
+        TASK_DIR   = 'TASK1'   // all Task 1 files live in this folder of the repo
     }
 
     stages {
@@ -37,13 +38,13 @@ pipeline {
         stage('Unit Tests') {
             steps {
                 // runs `node --test` inside the "test" stage of the Dockerfile
-                sh 'docker build --target test -t meditrack-test:${BUILD_NUMBER} .'
+                sh 'docker build --target test -t meditrack-test:${BUILD_NUMBER} ${TASK_DIR}'
             }
         }
 
         stage('Build Docker Image') {
             steps {
-                sh 'docker build --target runtime -t ${IMAGE} -t meditrack:latest .'
+                sh 'docker build --target runtime -t ${IMAGE} -t meditrack:latest ${TASK_DIR}'
                 sh 'docker images meditrack'
             }
         }
@@ -66,9 +67,9 @@ pipeline {
         stage('Deploy to Kubernetes') {
             steps {
                 sh '''
-                    kubectl apply -f k8s/namespace.yaml
-                    sed -e "s|__IMAGE__|${IMAGE}|g" -e "s|__VERSION__|${BUILD_NUMBER}|g" k8s/deployment.yaml | kubectl apply -f -
-                    kubectl apply -f k8s/service.yaml
+                    kubectl apply -f ${TASK_DIR}/k8s/namespace.yaml
+                    sed -e "s|__IMAGE__|${IMAGE}|g" -e "s|__VERSION__|${BUILD_NUMBER}|g" ${TASK_DIR}/k8s/deployment.yaml | kubectl apply -f -
+                    kubectl apply -f ${TASK_DIR}/k8s/service.yaml
                     kubectl -n ${NAMESPACE} rollout status deployment/${APP} --timeout=180s
                 '''
             }
