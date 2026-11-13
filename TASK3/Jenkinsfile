@@ -192,6 +192,7 @@ pipeline {
         stage('10. Runtime Policy Checks') {
             steps {
                 sh '''
+                    set +x   # keep the report clean (no command tracing)
                     # subshell: an `exit 1` inside stops only the checks, so the report is still printed
                     (
                     echo "== Pod security context (live) =="
@@ -248,7 +249,7 @@ EOF
                 echo "         SBOM: reports/sbom-${BUILD_NUMBER}.cdx.json"
                 echo "PASS  8. Deployed with Secret, NetworkPolicy, Pod Security 'restricted'"
                 echo "PASS  9. DAST - $(grep RESULT reports/dast.txt)"
-                echo "PASS 10. Runtime policy checks - $(grep -c '\\[PASS\\]' reports/runtime-policy.txt) passed"
+                echo "PASS 10. Runtime policy checks - $(grep -c '^\\[PASS\\]' reports/runtime-policy.txt) passed (PSA, egress, read-only FS)"
                 echo
                 echo "App: http://<EC2-PUBLIC-IP>:30100"
                 } | tee reports/SECURITY-SUMMARY.txt
