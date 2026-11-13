@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # One-shot setup for a single Ubuntu EC2 t3.micro (1 GB RAM):
-#   disk growth + swap + Docker + k3s (Kubernetes) + Jenkins + security scanners (Trivy, Gitleaks),
+#   swap + Docker + k3s (Kubernetes) + Jenkins + security scanners (Gitleaks, Trivy, OSV-Scanner),
 #   with the Task 9 DevSecOps pipeline job pre-created.
-#   Needs ~20 GB root volume: the Trivy vulnerability database alone is ~1.6 GB.
+#   Fits the default 8 GB disk: vulnerability lookups use OSV-Scanner (online OSV.dev database)
+#   instead of Trivy's ~1.6 GB local DB; Trivy is used for IaC, secret scanning and SBOMs.
 #
 # Usage (on the EC2 instance):
 #   sudo JENKINS_ADMIN_PASSWORD='choose-a-password' bash TASK3/infra/setup-ec2.sh https://github.com/<user>/<repo>.git
@@ -19,6 +20,8 @@ TRIVY_VERSION=0.76.2
 TRIVY_SHA256=bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
 GITLEAKS_VERSION=8.30.1
 GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+OSV_VERSION=2.7.1
+OSV_SHA256=fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8
 
 echo "==> 0/7 Grow root filesystem (if the EBS volume was enlarged)"
 ROOT_SRC=$(findmnt -n -o SOURCE /)
@@ -28,9 +31,9 @@ growpart "$ROOT_DISK" "$ROOT_PART" || true   # "NOCHANGE" if already full size
 resize2fs "$ROOT_SRC" || true
 df -h /
 
-echo "==> 1/7 Swap (2 GB) - required, t3.micro only has 1 GB RAM"
+echo "==> 1/7 Swap (1.5 GB) - required, t3.micro only has 1 GB RAM"
 if ! swapon --show | grep -q /swapfile; then
-  fallocate -l 2G /swapfile
+  fallocate -l 1536M /swapfile
   chmod 600 /swapfile
   mkswap /swapfile
   swapon /swapfile
@@ -54,7 +57,7 @@ fi
 until kubectl get nodes 2>/dev/null | grep -q ' Ready'; do echo "   waiting for k3s node..."; sleep 5; done
 kubectl get nodes
 
-echo "==> 4/7 Security scanners: Trivy ${TRIVY_VERSION}, Gitleaks ${GITLEAKS_VERSION} (checksum verified)"
+echo "==> 4/7 Security scanners: Gitleaks ${GITLEAKS_VERSION}, Trivy ${TRIVY_VERSION}, OSV-Scanner ${OSV_VERSION} (checksum verified)"
 TMPD=$(mktemp -d)
 if ! trivy --version 2>/dev/null | grep -q "$TRIVY_VERSION"; then
   curl -fsSL -o "$TMPD/trivy.tgz" "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
@@ -66,8 +69,13 @@ if ! gitleaks version 2>/dev/null | grep -q "$GITLEAKS_VERSION"; then
   echo "${GITLEAKS_SHA256}  $TMPD/gitleaks.tgz" | sha256sum -c -
   tar -xzf "$TMPD/gitleaks.tgz" -C "$TMPD" gitleaks && install -m 755 "$TMPD/gitleaks" /usr/local/bin/gitleaks
 fi
+if ! osv-scanner --version 2>/dev/null | grep -q "$OSV_VERSION"; then
+  curl -fsSL -o "$TMPD/osv-scanner" "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_linux_amd64"
+  echo "${OSV_SHA256}  $TMPD/osv-scanner" | sha256sum -c -
+  install -m 755 "$TMPD/osv-scanner" /usr/local/bin/osv-scanner
+fi
 rm -rf "$TMPD"
-trivy --version | head -1; gitleaks version
+trivy --version | head -1; gitleaks version; osv-scanner --version | head -1
 
 echo "==> 5/7 Jenkins (war + systemd, heap capped for the small instance)"
 id jenkins >/dev/null 2>&1 || useradd -r -m -d "$JENKINS_HOME" -s /bin/bash jenkins
@@ -76,13 +84,8 @@ mkdir -p /opt/jenkins "$JENKINS_HOME/.kube" "$JENKINS_HOME/init.groovy.d" "$JENK
 [ -f /opt/jenkins/jenkins.war ] || curl -fsSL -o /opt/jenkins/jenkins.war https://get.jenkins.io/war-stable/latest/jenkins.war
 cp /etc/rancher/k3s/k3s.yaml "$JENKINS_HOME/.kube/config"
 
-echo "   pre-downloading the Trivy vulnerability DB (~1.6 GB unpacked) for the jenkins user"
 mkdir -p "$JENKINS_HOME/.cache/trivy" && chown -R jenkins:jenkins "$JENKINS_HOME/.cache"
-FREE_MB=$(df -m --output=avail / | tail -1)
-if [ "$FREE_MB" -lt 3500 ]; then
-  echo "WARNING: only ${FREE_MB} MB free. Enlarge the EBS volume to 20 GB, or Trivy will run out of disk."
-fi
-sudo -u jenkins trivy image --download-db-only --cache-dir "$JENKINS_HOME/.cache/trivy" --quiet
+docker pull -q node:22-alpine   # base image, also scanned for the before/after comparison
 
 echo "==> 6/7 Jenkins plugins"
 if [ ! -f /opt/jenkins/plugin-manager.jar ]; then

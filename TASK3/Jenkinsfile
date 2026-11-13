@@ -3,9 +3,13 @@
 // "Shift-left" security: every stage below is a SECURITY GATE. If a gate finds a problem
 // the pipeline stops and the vulnerable version never reaches Kubernetes.
 //
-//  Code       ─► 1 Secret scan (Gitleaks) ─► 2 SAST (ESLint security) ─► 3 SCA (Trivy fs)
+//  Code       ─► 1 Secret scan (Gitleaks) ─► 2 SAST (ESLint security) ─► 3 SCA (OSV-Scanner) + file secrets (Trivy)
 //  Infra      ─► 4 IaC scan (Trivy config: Dockerfile + Kubernetes YAML)
-//  Build      ─► 5 Unit + security tests ─► 6 Build hardened image ─► 7 Image scan (Trivy)
+//  Build      ─► 5 Unit + security tests ─► 6 Build hardened image ─► 7 Image scan (OSV-Scanner) + SBOM + secrets (Trivy)
+//
+//  Vulnerability scanning uses OSV-Scanner (queries the online OSV.dev database) because Trivy's local
+//  vulnerability DB (~1.6 GB) does not fit on the 8 GB disk of the t3.micro. Trivy is still used for
+//  IaC misconfiguration, secret scanning and SBOM generation, which need no vulnerability DB.
 //  Deploy     ─► 8 Deploy (Secret, NetworkPolicy, Pod Security "restricted")
 //  Runtime    ─► 9 DAST against the running app ─► 10 Runtime policy checks
 //  Evidence   ─► all reports archived as build artifacts (audit trail)
@@ -31,6 +35,7 @@ pipeline {
         KUBECONFIG      = '/var/lib/jenkins/.kube/config'
         APP_URL         = 'http://localhost:30100'
         TRIVY_CACHE_DIR = '/var/lib/jenkins/.cache/trivy'
+        BASE_IMAGE      = 'node:22-alpine'
         // pinned SAST tool versions (supply-chain hygiene)
         ESLINT_PKGS     = 'eslint@9.39.5 eslint-plugin-security@3.0.1'
     }
@@ -42,7 +47,7 @@ pipeline {
                 sh '''
                     git log -1 --pretty="Commit %h by %an: %s"
                     rm -rf reports && mkdir -p reports
-                    gitleaks version; trivy --version | head -1
+                    gitleaks version; trivy --version | head -1; osv-scanner --version | head -1
                 '''
             }
         }
@@ -76,14 +81,21 @@ pipeline {
             }
         }
 
-        stage('3. SCA - Dependencies (Trivy fs)') {
+        stage('3. SCA (OSV-Scanner) + File Secrets (Trivy)') {
             steps {
                 sh '''
+                    # Software Composition Analysis: third-party dependencies vs the OSV.dev vulnerability database
                     rc=0
-                    trivy fs --quiet --scanners vuln,secret --severity HIGH,CRITICAL --exit-code 1 \
-                        $TASK_DIR/app > reports/sca-trivy-fs.txt 2>&1 || rc=$?
-                    cat reports/sca-trivy-fs.txt
-                    exit $rc
+                    osv-scanner scan source -r $TASK_DIR/app > reports/sca-osv.txt 2>&1 || rc=$?
+                    if [ $rc -eq 128 ]; then
+                        echo "No third-party dependencies (Node.js built-ins only): nothing to exploit in the supply chain" >> reports/sca-osv.txt
+                        rc=0
+                    fi
+                    grep -vE "filesystem walk|End status" reports/sca-osv.txt
+                    [ $rc -eq 0 ] || exit $rc
+                    # secrets / private keys in the source files
+                    trivy fs --quiet --scanners secret --exit-code 1 $TASK_DIR > reports/secrets-trivy-fs.txt 2>&1 || { cat reports/secrets-trivy-fs.txt; exit 1; }
+                    echo "Trivy secret scan of $TASK_DIR: no secrets found" | tee -a reports/secrets-trivy-fs.txt
                 '''
             }
         }
@@ -112,15 +124,28 @@ pipeline {
             }
         }
 
-        stage('7. Image Scan (Trivy image)') {
+        stage('7. Image Scan (OSV-Scanner) + SBOM') {
             steps {
                 sh '''
-                    # full report, all severities
-                    trivy image --quiet --skip-java-db-update --scanners vuln,secret ${IMAGE} > reports/image-trivy.txt 2>&1 || true
-                    cat reports/image-trivy.txt
-                    # gate: any fixable HIGH/CRITICAL vulnerability or embedded secret blocks the release
-                    trivy image --quiet --skip-db-update --skip-java-db-update --scanners vuln,secret \
-                        --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 ${IMAGE} > /dev/null
+                    TMP_TAR=$(mktemp /tmp/image-XXXXXX.tar)
+                    # (a) for comparison: the plain base image, before our hardening (report only)
+                    docker save $BASE_IMAGE -o $TMP_TAR
+                    osv-scanner scan image --archive $TMP_TAR 2>&1 | grep -vE "filesystem walk|End status" > reports/image-osv-BASE-node22alpine.txt || true
+                    # (b) GATE: our hardened image - any known vulnerability blocks the release
+                    docker save ${IMAGE} -o $TMP_TAR
+                    rc=0
+                    osv-scanner scan image --archive $TMP_TAR > reports/image-osv-hardened.raw 2>&1 || rc=$?
+                    rm -f $TMP_TAR
+                    grep -vE "filesystem walk|End status" reports/image-osv-hardened.raw > reports/image-osv-hardened.txt; rm -f reports/image-osv-hardened.raw
+                    echo "------ base image ($BASE_IMAGE) ------";  grep -E "known vulnerabilit|No issues" reports/image-osv-BASE-node22alpine.txt || true
+                    echo "------ hardened image (${IMAGE}) ------"; cat reports/image-osv-hardened.txt
+                    [ $rc -eq 0 ] || exit $rc
+                    # secrets baked into image layers (no vulnerability DB needed)
+                    trivy image --quiet --scanners secret --exit-code 1 ${IMAGE} > reports/image-secrets-trivy.txt 2>&1 || { cat reports/image-secrets-trivy.txt; exit 1; }
+                    echo "Trivy: no secrets in image layers" | tee -a reports/image-secrets-trivy.txt
+                    # Software Bill of Materials (CycloneDX) - inventory of everything inside the image
+                    trivy image --quiet --format cyclonedx --output reports/sbom-${BUILD_NUMBER}.cdx.json ${IMAGE}
+                    echo "SBOM written: reports/sbom-${BUILD_NUMBER}.cdx.json ($(grep -o '"type": *"library"' reports/sbom-${BUILD_NUMBER}.cdx.json | wc -l) libraries)"
                 '''
             }
         }
@@ -214,11 +239,13 @@ EOF
                 echo
                 echo "PASS  1. Secret scan (Gitleaks, full git history) - $(grep -o 'no leaks found' reports/gitleaks.txt || echo see report)"
                 echo "PASS  2. SAST (ESLint security) - $(grep -oE '[0-9]+ errors?, [0-9]+ warnings?' reports/sast-eslint.txt || echo 'no findings')"
-                echo "PASS  3. SCA (Trivy fs) - no HIGH/CRITICAL dependency vulnerabilities"
+                echo "PASS  3. SCA (OSV-Scanner) - $(tail -1 reports/sca-osv.txt); file secret scan clean"
                 echo "PASS  4. IaC scan (Trivy config) - no HIGH/CRITICAL misconfigurations"
                 echo "PASS  5. Unit + security tests"
                 echo "PASS  6. Hardened image built: ${IMAGE}"
-                echo "PASS  7. Image scan (Trivy) - no fixable HIGH/CRITICAL vulnerabilities"
+                echo "PASS  7. Image scan (OSV-Scanner) - hardened image: $(grep -oE 'No issues found|Total.*vulnerabilit[a-z]*' reports/image-osv-hardened.txt | head -1)"
+                echo "         (base image $BASE_IMAGE: $(grep -oE 'Total.*vulnerabilit[a-z]* \\([^)]*\\)|No issues found' reports/image-osv-BASE-node22alpine.txt | head -1))"
+                echo "         SBOM: reports/sbom-${BUILD_NUMBER}.cdx.json"
                 echo "PASS  8. Deployed with Secret, NetworkPolicy, Pod Security 'restricted'"
                 echo "PASS  9. DAST - $(grep RESULT reports/dast.txt)"
                 echo "PASS 10. Runtime policy checks - $(grep -c '\\[PASS\\]' reports/runtime-policy.txt) passed"

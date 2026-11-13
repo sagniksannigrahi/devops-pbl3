@@ -12,17 +12,23 @@ Runs on its own **AWS EC2 t3.micro** (separate from Tasks 7 and 8) with Jenkins 
    │
    ├─ 1 Secret scan ........ Gitleaks: whole git history          ┐
    ├─ 2 SAST ............... ESLint + eslint-plugin-security      │  CODE
-   ├─ 3 SCA ................ Trivy fs: dependency CVEs            ┘
+   ├─ 3 SCA ................ OSV-Scanner + Trivy file secrets    ┘
    ├─ 4 IaC scan ........... Trivy config: Dockerfile + K8s YAML     INFRA
    ├─ 5 Unit + security tests (18 tests)                         ┐
    ├─ 6 Build hardened image                                     │  BUILD
-   ├─ 7 Image scan ......... Trivy image: OS + app CVEs, secrets ┘
+   ├─ 7 Image scan ......... OSV-Scanner CVEs, Trivy secrets+SBOM┘
    ├─ 8 Secure deploy ...... Secret, NetworkPolicy, Pod Security "restricted"   DEPLOY
    ├─ 9 DAST ............... 27 attacks against the running app  ┐  RUNTIME
    └─10 Runtime policy ..... PSA rejects root pod, egress blocked,┘
                              read-only filesystem
    reports/ ─► archived on every build (audit evidence)
 ```
+
+## Why OSV-Scanner for vulnerabilities?
+Trivy's local vulnerability database is about **1.6 GB** unpacked, which doesn't fit on the t3.micro's 8 GB disk
+(the college AWS plan does not allow enlarging it). Vulnerability lookups therefore use **Google OSV-Scanner**,
+which queries the online **OSV.dev** database, so there's no local DB. **Trivy** is still used for IaC misconfiguration
+scanning, secret scanning and SBOM generation, none of which need the vulnerability DB.
 
 ## Security controls by layer
 
@@ -42,7 +48,9 @@ Runs on its own **AWS EC2 t3.micro** (separate from Tasks 7 and 8) with Jenkins 
 | | `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, drop **ALL** capabilities, seccomp `RuntimeDefault`, no service-account token, CPU and memory limits | `k8s/deployment.yaml` |
 | | **NetworkPolicy**: deny all by default; only inbound HTTP allowed; **no egress**, so a compromised pod cannot exfiltrate data | `k8s/networkpolicy.yaml` |
 | | Secrets generated on the cluster, never in git or Jenkins logs (`set +x`) | `Jenkinsfile` stage 8 |
-| **Pipeline** | Scanner versions pinned, with SHA-256 verification of the Trivy and Gitleaks downloads | `infra/setup-ec2.sh` |
+| **Pipeline** | Scanner versions pinned, with SHA-256 verification of the Gitleaks, Trivy and OSV-Scanner downloads | `infra/setup-ec2.sh` |
+| | **SBOM** (CycloneDX) generated for every image: a full inventory of what's inside | `reports/sbom-*.cdx.json` |
+| | Base-image comparison: plain `node:22-alpine` has **1 CRITICAL** CVE (zlib); the hardened image has **0** | `reports/image-osv-*.txt` |
 | | All scan reports archived per build as compliance evidence | `reports/` |
 
 ## HIPAA-style mapping (illustrative)
@@ -66,11 +74,10 @@ Runs on its own **AWS EC2 t3.micro** (separate from Tasks 7 and 8) with Jenkins 
 | `security/eslint.config.cjs` | SAST rules: high-confidence rules fail the build, noisy ones warn |
 | `security/dast-baseline.sh` | DAST: 27 black-box checks against the live app |
 | `Jenkinsfile` | The 10-gate DevSecOps pipeline |
-| `infra/setup-ec2.sh` | EC2 setup: disk growth, swap, Docker, k3s, Jenkins, Trivy, Gitleaks |
+| `infra/setup-ec2.sh` | EC2 setup: swap, Docker, k3s, Jenkins, Gitleaks, Trivy, OSV-Scanner |
 
 ## Setup
-1. Launch an Ubuntu EC2 t3.micro and **enlarge the root volume to 20 GB** (the Trivy DB is about 1.6 GB).
-   In its security group, allow inbound **22**, **8080** and **30100**.
+1. Launch an Ubuntu EC2 t3.micro (the default 8 GB disk is enough). In its security group, allow inbound **22**, **8080** and **30100**.
 2. On the instance:
    ```bash
    git clone <this repo> && cd <repo>
