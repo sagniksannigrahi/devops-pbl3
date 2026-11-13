@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MediTrack</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; background: #f4f7fb; color: #1d2733; }
+    header { background: #0b6e99; color: #fff; padding: 20px 32px; }
+    header h1 { margin: 0; font-size: 26px; }
+    main { max-width: 860px; margin: 24px auto; padding: 0 16px; }
+    .card { background: #fff; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+    .meta span { display: inline-block; margin-right: 24px; }
+    .meta b { color: #0b6e99; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #e3e8ef; }
+    th { background: #eef3f8; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>MediTrack - Patient Records</h1>
+    <div>Deployed on Kubernetes via a Jenkins CI/CD pipeline</div>
+  </header>
+  <main>
+    <div class="card meta" id="info">Loading deployment info...</div>
+    <div class="card">
+      <h2>Patients</h2>
+      <table>
+        <thead><tr><th>ID</th><th>Name</th><th>Age</th><th>Department</th><th>Status</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </main>
+  <script>
+    fetch('/api/info').then(r => r.json()).then(i => {
+      document.getElementById('info').innerHTML =
+        '<span>Version: <b>' + i.version + '</b></span>' +
+        '<span>Served by pod: <b>' + i.pod + '</b></span>' +
+        '<span>Time: <b>' + new Date(i.time).toLocaleString() + '</b></span>';
+    });
+    fetch('/api/patients').then(r => r.json()).then(list => {
+      const rows = document.getElementById('rows');
+      list.forEach(p => {
+        const tr = document.createElement('tr');
+        [p.id, p.name, p.age, p.department, p.status].forEach(v => {
+          const td = document.createElement('td');
+          td.textContent = v;
+          tr.appendChild(td);
+        });
+        rows.appendChild(tr);
+      });
+    });
+  </script>
+</body>
+</html>

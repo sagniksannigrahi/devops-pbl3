@@ -1,0 +1,6 @@
+# never commit keys or secrets
+*.pem
+*.key
+.env
+node_modules/
+.DS_Store
