@@ -255,7 +255,8 @@ EOF
                 } | tee reports/SECURITY-SUMMARY.txt
             '''
         }
-        always {
+        // cleanup runs LAST (after success), so SECURITY-SUMMARY.txt is included in the archive
+        cleanup {
             archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
             sh '''
                 docker rmi meditrack-secure-test:${BUILD_NUMBER} 2>/dev/null || true
